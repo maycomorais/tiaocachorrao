@@ -10,6 +10,22 @@
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
     />
     <link rel="stylesheet" href="admin.css" />
+    <style>
+      /* ── Componentes de Assinatura ── */
+      .sub-card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px 18px}
+      .sub-card-label{font-size:.75rem;color:#94a3b8;text-transform:uppercase;font-weight:600;letter-spacing:.4px;margin-bottom:6px}
+      .sub-card-value{font-size:1.15rem;font-weight:700;color:#1e293b}
+      .sub-section{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin-bottom:16px}
+      .sub-section-title{font-size:.92rem;font-weight:700;color:#334155;margin:0 0 16px;padding-bottom:10px;border-bottom:1px solid #f1f5f9}
+      .sub-label{display:block;font-size:.75rem;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px}
+      .sub-input{width:100%;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:.9rem;outline:none;transition:border .2s;box-sizing:border-box;background:#fff;color:#1e293b}
+      .sub-input:focus{border-color:#1a7a2e}
+      .sub-btn-primary{padding:10px 20px;background:linear-gradient(135deg,#1a7a2e,#145a22);color:#fff;border:none;border-radius:9px;font-weight:700;font-size:.88rem;cursor:pointer;transition:opacity .2s;white-space:nowrap}
+      .sub-btn-primary:hover{opacity:.88}
+      .sub-btn-primary:disabled{opacity:.55;cursor:not-allowed}
+      .sub-btn-secondary{padding:10px 18px;background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;border-radius:9px;font-weight:600;font-size:.88rem;cursor:pointer;white-space:nowrap}
+      .sub-btn-secondary:hover{background:#e2e8f0}
+    </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <base target="_blank">
   <style>
@@ -222,6 +238,13 @@
           title="Español">🇵🇾 ES</button>
       </div>
 
+      <div class="menu-item" onclick="abrirModalAlterarSenha()" style="background:#145a22;color:#d1fae5" title="Alterar minha senha">
+        <i class="fas fa-key"></i><span class="mobile-hide"> Senha</span>
+      </div>
+      <div id="menu-assinatura" class="menu-item" onclick="showTab('assinatura', event)"
+        style="display:none;background:#0f3460;color:#93c5fd" title="Controle de Assinatura">
+        <i class="fas fa-credit-card"></i><span class="mobile-hide"> Assinatura</span>
+      </div>
       <div class="menu-item" onclick="logout()" style="margin-top: auto; background: #c0392b">
         <i class="fas fa-sign-out-alt"></i><span class="mobile-hide " data-i18n="sidebar.sair"> Sair</span>
       </div>
@@ -1692,6 +1715,22 @@
         </div>
       </div>
 
+      <!-- ═══════════════════════════════════════════════════════ -->
+      <!-- TAB: ASSINATURA — somente adminMaster                   -->
+      <!-- ═══════════════════════════════════════════════════════ -->
+      <div id="assinatura" class="tab-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:20px">
+          <h2 class="section-title" style="margin:0">🕹️ Controle de Assinatura</h2>
+          <button class="btn" style="background:#f1f5f9;color:#475569;border:1px solid #e2e8f0"
+            onclick="carregarPainelAssinatura()">🔄 Atualizar</button>
+        </div>
+        <div id="painel-assinatura">
+          <div style="text-align:center;padding:60px;color:#94a3b8">
+            Navegue até esta aba para carregar.
+          </div>
+        </div>
+      </div>
+
     </div><!-- /main-content -->
 
 
@@ -2293,6 +2332,10 @@
 
     <script src="supabaseClient.js"></script>
     <script src="admin-i18n.js"></script>
+    <script src="subscriptionDateUtils.js"></script>
+    <script src="subscriptionService.js"></script>
+    <script src="subscriptionUI.js"></script>
+    <script src="subscriptionAdmin.js"></script>
     <script src="admin.js"></script>
     <script src="ficha-tecnica.js"></script>
     <script src="estatisticas.js"></script>

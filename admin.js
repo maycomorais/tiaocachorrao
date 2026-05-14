@@ -192,6 +192,20 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     carregarDashboard();
     carregarMotoboysSelect();
+
+    // ── Controle de Assinatura (barra de aviso / bloqueio) ──
+    if (typeof SubscriptionUI !== "undefined") {
+      SubscriptionUI.inicializar({
+        supabaseUrl:  typeof _SUPABASE_URL !== "undefined" ? _SUPABASE_URL : "",
+        supabaseKey:  typeof _SUPABASE_KEY !== "undefined" ? _SUPABASE_KEY : "",
+        contatoFone:  "595976771714",
+        contatoNome:  "SuporteLinkPY",
+      });
+    }
+
+    // Exibe menu Assinatura somente para adminMaster
+    const menuAssin = document.getElementById("menu-assinatura");
+    if (menuAssin) menuAssin.style.display = perfilUsuario === "adminMaster" ? "flex" : "none";
   }
 
   let _lastWidth = window.innerWidth;
@@ -235,6 +249,49 @@ document.addEventListener("DOMContentLoaded", async () => {
 });
 
 // selecionarTipo do Gemini removido — o sistema usa selecionarTipoBuilder() abaixo
+
+// =========================================
+// CLOUDINARY — UPLOAD UTILITÁRIO
+// =========================================
+const CLOUDINARY_CLOUD_NAME = "dsxwnbj0o";
+const CLOUDINARY_UPLOAD_PRESET = "ml_default";
+const CLOUDINARY_ENDPOINT = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
+
+/**
+ * Faz upload de um arquivo de imagem diretamente para o Cloudinary
+ * usando um Unsigned Upload Preset público.
+ *
+ * @param {File} file - O objeto File selecionado pelo usuário.
+ * @returns {Promise<string>} - A secure_url final da imagem no Cloudinary.
+ * @throws {Error} - Lança um erro se o upload falhar, impedindo o salvamento no Supabase.
+ */
+async function uploadImageToCloudinary(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+
+  const response = await fetch(CLOUDINARY_ENDPOINT, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let errMsg = `HTTP ${response.status}`;
+    try {
+      const errData = await response.json();
+      errMsg = errData?.error?.message || errMsg;
+    } catch (_) {}
+    throw new Error(`Cloudinary upload falhou: ${errMsg}`);
+  }
+
+  const data = await response.json();
+
+  if (!data.secure_url) {
+    throw new Error("Cloudinary não retornou uma URL válida.");
+  }
+
+  return data.secure_url;
+}
 
 // =========================================
 // 2. CONTROLE DE ABAS
@@ -315,6 +372,7 @@ function showTab(tabId, event) {
     amCarregarUsuarios();
     renderPainelFeatures();
   }
+  if (realTabId === "assinatura") carregarPainelAssinatura();
   if (realTabId === "estatisticas") {
     initEstatisticas();
     _estPopularCategorias();
@@ -1338,48 +1396,143 @@ let _caixaState = {
   qtdPedidos: 0,
 };
 
+// Sessão de caixa ativa (carregada ao abrir a aba financeiro)
+let _sessaoCaixaAtiva = null;
+// { id, usuario_email, aberto_em, fechado_em, valor_abertura }
+
+// ─────────────────────────────────────────────────────────────
+// GERENCIAMENTO DE SESSÃO DE CAIXA
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Carrega a sessão de caixa ativa para o usuário corrente.
+ * Gestores veem qualquer sessão aberta (ou a mais recente).
+ * Funcionário vê apenas a sua própria.
+ */
+async function _carregarSessaoCaixa() {
+  const ehGestor   = ["dono", "gerente", "adminMaster"].includes(perfilUsuario);
+  const emailAtual = document.getElementById("user-email")?.innerText || "";
+
+  let q = supa
+    .from("sessoes_caixa")
+    .select("*")
+    .is("fechado_em", null)          // só sessões ABERTAS
+    .order("aberto_em", { ascending: false })
+    .limit(1);
+
+  if (!ehGestor) q = q.eq("usuario_email", emailAtual);
+
+  const { data } = await q;
+  _sessaoCaixaAtiva = data?.[0] || null;
+
+  // Atualiza o indicador visual de status do caixa (se existir no HTML)
+  const elStatus = document.getElementById("status-sessao-caixa");
+  if (elStatus) {
+    if (_sessaoCaixaAtiva) {
+      const dAbr = new Date(_sessaoCaixaAtiva.aberto_em).toLocaleString("pt-BR", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" });
+      elStatus.innerHTML = `<span style="color:#27ae60">🟢 Caixa aberto desde ${dAbr}</span>`;
+    } else {
+      elStatus.innerHTML = `<span style="color:#e74c3c">🔴 Nenhum caixa aberto</span>`;
+    }
+  }
+}
+
+/**
+ * Exibe alerta de abertura de caixa e abre o modal para registro.
+ */
+function _exibirAlertaAberturaCaixa() {
+  const ehGestor = ["dono", "gerente", "adminMaster"].includes(perfilUsuario);
+  const msg = ehGestor
+    ? "⚠️ Nenhuma sessão de caixa está aberta no momento.\n\nDeseja abrir o caixa agora?"
+    : "⚠️ Você ainda não abriu o caixa hoje.\n\nÉ necessário registrar a abertura para contabilizar as vendas nesta sessão.\n\nDeseja abrir o caixa agora?";
+
+  if (confirm(msg)) {
+    abrirModalCaixa("abertura");
+  }
+}
+
+/**
+ * Abre nova sessão de caixa no Supabase e carrega em _sessaoCaixaAtiva.
+ * Chamado ao salvar uma movimentação do tipo "abertura".
+ */
+async function _abrirSessaoCaixa(valorAbertura, descricao) {
+  const emailAtual = document.getElementById("user-email")?.innerText || "";
+  const nome       = document.getElementById("user-nome-display")?.innerText || emailAtual;
+
+  const { data, error } = await supa
+    .from("sessoes_caixa")
+    .insert([{
+      usuario_email:  emailAtual,
+      usuario_nome:   nome,
+      aberto_em:      new Date().toISOString(),
+      valor_abertura: valorAbertura || 0,
+      observacao:     descricao || null,
+    }])
+    .select()
+    .single();
+
+  if (error) throw error;
+  _sessaoCaixaAtiva = data;
+  return data;
+}
+
 async function calcularFinanceiro() {
   const abaFin = document.getElementById("financeiro");
   if (!abaFin || !abaFin.classList.contains("active")) return;
 
-  const elInicio = document.getElementById("fin-inicio");
-  const elFim = document.getElementById("fin-fim");
-  const elTipo = document.getElementById("fin-tipo");
+  const elInicio  = document.getElementById("fin-inicio");
+  const elFim     = document.getElementById("fin-fim");
+  const elTipo    = document.getElementById("fin-tipo");
   const elFactura = document.getElementById("fin-factura");
   if (!elInicio || !elFim || !elTipo) return;
 
-  const hoje = new Date();
-  const ano = hoje.getFullYear();
-  const mes = String(hoje.getMonth() + 1).padStart(2, "0");
-  const dia = String(hoje.getDate()).padStart(2, "0");
-  if (!elInicio.value) elInicio.value = `${ano}-${mes}-${dia}`;
-  if (!elFim.value) elFim.value = `${ano}-${mes}-${dia}`;
-
-  const inicio = elInicio.value,
-    fim = elFim.value;
-  const tipoFiltro = elTipo.value;
-  const facturaFiltro = elFactura ? elFactura.value : "todos";
-
-  // UTC correction for PY (UTC-4)
-  const _tz = 4 * 60 * 60 * 1000;
-  const utcI = new Date(
-    new Date(inicio + "T00:00:00").getTime() + _tz,
-  ).toISOString();
-  const utcF = new Date(
-    new Date(fim + "T23:59:59").getTime() + _tz,
-  ).toISOString();
-
-  // ── Determina se é visão geral ou caixa próprio ────────────────
-  const ehGestor = ["dono", "gerente", "adminMaster"].includes(perfilUsuario);
+  const ehGestor   = ["dono", "gerente", "adminMaster"].includes(perfilUsuario);
   const emailAtual = document.getElementById("user-email")?.innerText || "";
 
+  // ── 1. Carrega/verifica sessão ativa ─────────────────────────────
+  await _carregarSessaoCaixa();
+
+  // ── 2. Se não houver sessão aberta, exibe alerta de abertura ─────
+  if (!_sessaoCaixaAtiva) {
+    _exibirAlertaAberturaCaixa();
+    return; // não renderiza nada enquanto não houver sessão
+  }
+
+  // ── 3. Define intervalo de tempo baseado na SESSÃO, não no calendário ─
+  const sessaoInicio = _sessaoCaixaAtiva.aberto_em;
+  const sessaoFim    = _sessaoCaixaAtiva.fechado_em || new Date().toISOString();
+
+  // Gestores podem sobrepor o intervalo com o filtro de datas da tela
+  let utcI = sessaoInicio;
+  let utcF = sessaoFim;
+  if (ehGestor && elInicio.value && elFim.value) {
+    const _tz = 4 * 60 * 60 * 1000; // UTC-4 PY
+    utcI = new Date(new Date(elInicio.value + "T00:00:00").getTime() + _tz).toISOString();
+    utcF = new Date(new Date(elFim.value   + "T23:59:59").getTime() + _tz).toISOString();
+  } else if (!elInicio.value || !elFim.value) {
+    // Preenche os campos de data com os valores da sessão para exibição
+    const dAbr = new Date(sessaoInicio);
+    elInicio.value = dAbr.toISOString().split("T")[0];
+    const dFch = new Date(sessaoFim);
+    elFim.value    = dFch.toISOString().split("T")[0];
+  }
+
+  const tipoFiltro    = elTipo.value;
+  const facturaFiltro = elFactura ? elFactura.value : "todos";
+
+  // ── 4. Busca pedidos dentro da janela da sessão ───────────────────
   let query = supa
     .from("pedidos")
     .select("*, motoboys(nome)")
     .in("status", ["entregue", "em_preparo", "pronto_entrega", "saiu_entrega"])
     .gte("created_at", utcI)
     .lte("created_at", utcF);
+
   if (tipoFiltro !== "todos") query = query.eq("forma_pagamento", tipoFiltro);
+
+  // Funcionário: filtra apenas pedidos relacionados ao seu usuário
+  // (via mesa/operador, se seu schema tiver esse campo — ajuste o campo se necessário)
+  // if (!ehGestor) query = query.eq("operador_email", emailAtual);
 
   const { data: pedidos } = await query;
   let peds = pedidos || [];
@@ -1389,12 +1542,11 @@ async function calcularFinanceiro() {
   else if (facturaFiltro === "sem_factura")
     peds = peds.filter((p) => !p.dados_factura?.ruc && !p.dados_factura?.ci);
 
-  // ── Movimentações de caixa ─────────────────────────────────────
+  // ── 5. Movimentações de caixa da SESSÃO ──────────────────────────
   let caixaQuery = supa
     .from("movimentacoes_caixa")
     .select("*")
-    .gte("created_at", inicio + " 00:00:00")
-    .lte("created_at", fim + " 23:59:59");
+    .eq("sessao_id", _sessaoCaixaAtiva.id); // vínculo direto à sessão
   if (!ehGestor) caixaQuery = caixaQuery.eq("usuario_email", emailAtual);
 
   const { data: caixa } = await caixaQuery;
@@ -1402,28 +1554,16 @@ async function calcularFinanceiro() {
   // Verifica bloqueio de caixa (sangria limite)
   _verificarBloqueioCaixa(emailAtual);
 
-  // ── Cálculos ───────────────────────────────────────────────────
+  // ── 6. Cálculos (inalterado) ──────────────────────────────────────
   const safeNum = (v) => {
     if (!v) return 0;
     if (typeof v === "number") return v;
-    return (
-      parseFloat(
-        v
-          .toString()
-          .replace(/[^\d.,-]/g, "")
-          .replace(",", "."),
-      ) || 0
-    );
+    return parseFloat(v.toString().replace(/[^\d.,-]/g,"").replace(",",".")) || 0;
   };
   const fmt = (n) => "Gs " + n.toLocaleString("es-PY");
 
-  let faturamento = 0,
-    totalPix = 0,
-    totalTransf = 0,
-    totalCartao = 0,
-    totalEfetivo = 0;
-  let custoEntregas = 0,
-    qtdPedidos = 0;
+  let faturamento = 0, totalPix = 0, totalTransf = 0, totalCartao = 0, totalEfetivo = 0;
+  let custoEntregas = 0, qtdPedidos = 0;
   const motoMap = {};
 
   peds.forEach((p) => {
@@ -1431,157 +1571,105 @@ async function calcularFinanceiro() {
     faturamento += val;
     qtdPedidos++;
     const pag = (p.forma_pagamento || "").toLowerCase();
-    if (pag.includes("pix")) totalPix += val;
+    if (pag.includes("pix"))          totalPix    += val;
     else if (pag.includes("transfer")) totalTransf += val;
-    else if (pag.includes("cartao") || pag.includes("cartão"))
-      totalCartao += val;
-    else if (pag.includes("efetivo") || pag.includes("dinheiro"))
-      totalEfetivo += val;
-
+    else if (pag.includes("cartao") || pag.includes("cartão")) totalCartao += val;
+    else if (pag.includes("efetivo") || pag.includes("dinheiro")) totalEfetivo += val;
     if (p.tipo_entrega === "delivery") {
       const taxa = safeNum(p.frete_motoboy) || TAXA_MOTOBOY || 0;
       custoEntregas += taxa;
       const nm = p.motoboys?.nome || "Sem Motoboy";
-      if (!motoMap[nm]) {
-        motoMap[nm] = { entregas: 0, frete_total: 0 };
-        // Combustível NÃO somado aqui — calculado uma vez por motoboy identificado abaixo
-      }
+      if (!motoMap[nm]) motoMap[nm] = { entregas: 0, frete_total: 0 };
       motoMap[nm].entregas++;
       motoMap[nm].frete_total += taxa;
     }
   });
 
-  // Soma combustível uma vez por motoboy IDENTIFICADO (exclui "Sem Motoboy")
-  const qtdMotoboyUnicos = Object.keys(motoMap).filter(
-    (n) => n !== "Sem Motoboy",
-  ).length;
+  const qtdMotoboyUnicos = Object.keys(motoMap).filter(n => n !== "Sem Motoboy").length;
   custoEntregas += (AJUDA_COMBUSTIVEL || 0) * qtdMotoboyUnicos;
 
-  let totalSaidas = 0,
-    totalEntradas = 0,
-    totalSangria = 0;
+  let totalSaidas = 0, totalEntradas = 0, totalSangria = 0;
   (caixa || []).forEach((c) => {
     const v = safeNum(c.valor);
-    if (c.tipo === "despesa") totalSaidas += v;
-    if (c.tipo === "sangria") {
-      totalSaidas += v;
-      totalSangria += v;
-    }
+    if (c.tipo === "despesa")  totalSaidas  += v;
+    if (c.tipo === "sangria")  { totalSaidas += v; totalSangria += v; }
     if (c.tipo === "suprimento" || c.tipo === "abertura") totalEntradas += v;
   });
 
-  _caixaState = {
-    faturamento,
-    custoEntregas,
-    totalSaidas,
-    totalEntradas,
-    totalPix,
-    totalTransf,
-    totalCartao,
-    totalEfetivo,
-    qtdPedidos,
-    totalSangria,
-  };
+  _caixaState = { faturamento, custoEntregas, totalSaidas, totalEntradas,
+                  totalPix, totalTransf, totalCartao, totalEfetivo, qtdPedidos, totalSangria };
 
   const lucro = faturamento + totalEntradas - custoEntregas - totalSaidas;
-  const setV = (id, v) => {
-    const el = document.getElementById(id);
-    if (el) el.innerText = v;
-  };
-  setV("card-faturamento", fmt(faturamento));
-  setV("card-custo-moto", fmt(custoEntregas));
-  setV("card-lucro", fmt(lucro));
-  setV("total-pix", fmt(totalPix));
-  setV("total-transf", fmt(totalTransf));
-  setV("total-cartao", fmt(totalCartao));
-  setV("total-efetivo", fmt(totalEfetivo));
-  setV("card-qtd-pedidos", qtdPedidos);
+  const setV  = (id, v) => { const el = document.getElementById(id); if (el) el.innerText = v; };
+
+  setV("card-faturamento",  fmt(faturamento));
+  setV("card-custo-moto",   fmt(custoEntregas));
+  setV("card-lucro",        fmt(lucro));
+  setV("total-pix",         fmt(totalPix));
+  setV("total-transf",      fmt(totalTransf));
+  setV("total-cartao",      fmt(totalCartao));
+  setV("total-efetivo",     fmt(totalEfetivo));
+  setV("card-qtd-pedidos",  qtdPedidos);
   setV("card-ticket-medio", fmt(qtdPedidos > 0 ? faturamento / qtdPedidos : 0));
 
-  // Identificação do caixa atual
+  // Badge do operador / info da sessão
   const badgeCaixa = document.getElementById("badge-caixa-operador");
   if (badgeCaixa) {
+    const dAbr = new Date(_sessaoCaixaAtiva.aberto_em).toLocaleString("pt-BR", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" });
+    const dFch = _sessaoCaixaAtiva.fechado_em
+      ? new Date(_sessaoCaixaAtiva.fechado_em).toLocaleString("pt-BR", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" })
+      : "em aberto";
     badgeCaixa.textContent = ehGestor
-      ? "📊 Visão geral — todos os caixas"
-      : `💼 Seu caixa — ${emailAtual}`;
+      ? `📊 Visão geral — sessão ${_sessaoCaixaAtiva.id} (${_sessaoCaixaAtiva.usuario_email}) · ${dAbr} → ${dFch}`
+      : `💼 Seu caixa — aberto ${dAbr} → ${dFch}`;
   }
 
-  // ── Tabela de despesas com Editar/Excluir ───────────────────────
+  // Tabelas de despesas e motoboys (código original preservado)
   const tbD = document.getElementById("lista-despesas-caixa");
   if (tbD) {
     const despesas = (caixa || []).filter((c) => c.tipo === "despesa");
     const _DLABELS = {
-      despesas_gerais: "📦 Despesas Gerais",
-      contas_fixas: "🏠 Contas Fixas",
-      pagamento_fornecedor: "🤝 Fornecedor",
-      pagamento_funcionario: "👷 Funcionário",
-      pagamento_terceiros: "👥 Terceiros",
-      manutencao: "🔧 Manutenção",
-      retirada: "💵 Retirada",
-      motoboy: "🛵 Motoboy",
-      outro: "✏️ Outro",
+      despesas_gerais:"📦 Despesas Gerais", contas_fixas:"🏠 Contas Fixas",
+      pagamento_fornecedor:"🤝 Fornecedor",  pagamento_funcionario:"👷 Funcionário",
+      pagamento_terceiros:"👥 Terceiros",    manutencao:"🔧 Manutenção",
+      retirada:"💵 Retirada", motoboy:"🛵 Motoboy", outro:"✏️ Outro",
     };
     if (!despesas.length) {
-      tbD.innerHTML =
-        '<tr><td colspan="5" style="text-align:center;color:#999;padding:16px">Nenhuma despesa no período</td></tr>';
+      tbD.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;padding:16px">Nenhuma despesa nesta sessão</td></tr>';
     } else {
-      tbD.innerHTML = despesas
-        .map((d) => {
-          const dt = new Date(d.created_at).toLocaleString("pt-BR", {
-            day: "2-digit",
-            month: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit",
-          });
-          const tipoLabel = _DLABELS[d.tipo_despesa] || d.tipo_despesa || "—";
-          const descExtra =
-            d.tipo_despesa === "outro" && d.descricao_outro
-              ? ` (${d.descricao_outro})`
-              : "";
-          const obs = d.descricao || "";
-          const enc = encodeURIComponent(
-            JSON.stringify({
-              id: d.id,
-              valor: d.valor,
-              tipo_despesa: d.tipo_despesa || "despesas_gerais",
-              descricao: d.descricao || "",
-              descricao_outro: d.descricao_outro || "",
-            }),
-          );
-          return `<tr>
+      tbD.innerHTML = despesas.map((d) => {
+        const dt = new Date(d.created_at).toLocaleString("pt-BR", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" });
+        const tipoLabel = _DLABELS[d.tipo_despesa] || d.tipo_despesa || "—";
+        const descExtra = d.tipo_despesa === "outro" && d.descricao_outro ? ` (${d.descricao_outro})` : "";
+        const obs = d.descricao || "";
+        const enc = encodeURIComponent(JSON.stringify({ id:d.id, valor:d.valor, tipo_despesa:d.tipo_despesa||"despesas_gerais", descricao:d.descricao||"", descricao_outro:d.descricao_outro||"" }));
+        return `<tr>
           <td style="white-space:nowrap;color:#666;font-size:0.82rem">${dt}</td>
           <td><span style="background:#fdecea;color:#a93226;padding:2px 7px;border-radius:10px;font-size:0.78rem">${tipoLabel}${descExtra}</span></td>
           <td style="color:#555;font-size:0.85rem">${obs}</td>
           <td style="text-align:right;font-weight:700;color:#c0392b;white-space:nowrap">${fmt(d.valor)}</td>
           <td style="text-align:center;white-space:nowrap">
-            <button onclick="abrirEditarDespesa('${enc}')"
-              style="background:#3498db;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.8rem;margin-right:4px">✏️</button>
-            <button onclick="excluirDespesa(${d.id})"
-              style="background:#e74c3c;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.8rem">🗑️</button>
-          </td>
-        </tr>`;
-        })
-        .join("");
+            <button onclick="abrirEditarDespesa('${enc}')" style="background:#3498db;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.8rem;margin-right:4px">✏️</button>
+            <button onclick="excluirDespesa(${d.id})" style="background:#e74c3c;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.8rem">🗑️</button>
+          </td></tr>`;
+      }).join("");
     }
   }
 
-  // Tabela motoboys
   const tbM = document.getElementById("lista-financeiro-motoboys");
   if (tbM) {
     tbM.innerHTML = "";
     if (!Object.keys(motoMap).length) {
-      tbM.innerHTML =
-        '<tr><td colspan="4" style="text-align:center;color:#999">Nenhuma entrega no período</td></tr>';
+      tbM.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#999">Nenhuma entrega nesta sessão</td></tr>';
     } else {
       for (const [nome, d] of Object.entries(motoMap)) {
         const semNome = nome === "Sem Motoboy";
         const comb = semNome ? 0 : AJUDA_COMBUSTIVEL || 0;
-        const tot = d.frete_total + comb;
+        const tot  = d.frete_total + comb;
         const combLabel = semNome
           ? '<span style="color:#aaa;font-size:0.78rem">sem combustível</span>'
           : `+ comb. ${fmt(comb)}`;
-        tbM.innerHTML += `<tr>
-          <td>${nome}</td><td>${d.entregas}</td>
+        tbM.innerHTML += `<tr><td>${nome}</td><td>${d.entregas}</td>
           <td style="font-size:0.82rem">Frete: ${fmt(d.frete_total)} ${combLabel}</td>
           <td><strong>${fmt(tot)}</strong></td></tr>`;
       }
@@ -2076,93 +2164,106 @@ function abrirModalCaixa(tipo) {
 }
 
 async function salvarMovimentacaoCaixa() {
-  const tipo = document.getElementById("tipo-caixa").value;
+  const tipo  = document.getElementById("tipo-caixa").value;
   const valor = parseFloat(document.getElementById("valor-caixa").value);
-  const desc = document.getElementById("desc-caixa").value.trim();
-  if (!valor || valor <= 0) {
-    alert("Digite um valor válido.");
-    return;
-  }
+  const desc  = document.getElementById("desc-caixa").value.trim();
+
+  if (!valor || valor <= 0) { alert("Digite um valor válido."); return; }
 
   const emailAtual = document.getElementById("user-email")?.innerText || "";
 
-  // Bloquear se caixa bloqueado (apenas para tipos que movimentam efetivo)
-  const { data: cfg } = await supa
-    .from("configuracoes")
-    .select("caixa_status")
-    .maybeSingle();
+  // Bloquear se caixa bloqueado
+  const { data: cfg } = await supa.from("configuracoes").select("caixa_status").maybeSingle();
   const status = cfg?.caixa_status || {};
   if (status[emailAtual]?.bloqueado && tipo !== "sangria") {
-    alert(
-      "⛔ Caixa bloqueado por sangria. Solicite autorização de um gestor para reabrir.",
-    );
+    alert("⛔ Caixa bloqueado por sangria. Solicite autorização de um gestor para reabrir.");
     return;
   }
 
-  // Tipo de despesa
-  let tipoDespesa = null;
-  let descOutro = null;
+  let tipoDespesa = null, descOutro = null;
   if (tipo === "despesa") {
-    tipoDespesa =
-      document.getElementById("tipo-despesa-sel")?.value || "despesas_gerais";
+    tipoDespesa = document.getElementById("tipo-despesa-sel")?.value || "despesas_gerais";
     if (tipoDespesa === "outro") {
-      descOutro =
-        document.getElementById("desc-outro-despesa")?.value?.trim() || "";
-      if (!descOutro) {
-        alert("Descreva o tipo da despesa.");
-        return;
-      }
+      descOutro = document.getElementById("desc-outro-despesa")?.value?.trim() || "";
+      if (!descOutro) { alert("Descreva o tipo da despesa."); return; }
     }
+  }
+
+  // ── Se for ABERTURA, cria a sessão primeiro ───────────────────────
+  if (tipo === "abertura") {
+    try {
+      await _abrirSessaoCaixa(valor, desc);
+      alert(`✅ Caixa aberto com fundo de Gs ${valor.toLocaleString("es-PY")}!`);
+      fecharModal("modal-caixa");
+      calcularFinanceiro();
+      return;
+    } catch (e) {
+      alert("Erro ao abrir caixa: " + e.message);
+      return;
+    }
+  }
+
+  // ── Para outros tipos, verifica se há sessão aberta ───────────────
+  if (!_sessaoCaixaAtiva) {
+    alert("⚠️ Nenhum caixa aberto. Abra o caixa antes de registrar movimentações.");
+    return;
   }
 
   const insert = {
     tipo,
     valor,
-    descricao: desc,
-    usuario_email: emailAtual,
-    tipo_despesa: tipoDespesa,
+    descricao:      desc,
+    usuario_email:  emailAtual,
+    tipo_despesa:   tipoDespesa,
     descricao_outro: descOutro,
+    sessao_id:      _sessaoCaixaAtiva.id,  // ← vínculo com a sessão
   };
 
   const { error } = await supa.from("movimentacoes_caixa").insert([insert]);
-  if (error) {
-    alert("Erro: " + error.message);
-    return;
-  }
+  if (error) { alert("Erro: " + error.message); return; }
+
   alert(t("alert.operacao_registrada"));
   fecharModal("modal-caixa");
   calcularFinanceiro();
 }
 
 async function fecharCaixaResumo() {
-  if (
-    !confirm(
-      "Fechar o caixa de hoje?\nIsso registra o fechamento e zera os totais exibidos.",
-    )
-  )
+  if (!_sessaoCaixaAtiva) {
+    alert("Nenhum caixa aberto para fechar.");
     return;
-  await calcularFinanceiro();
-  const s = _caixaState;
-  const fmt = (n) => "Gs " + n.toLocaleString("es-PY");
-  const lucro =
-    s.faturamento + s.totalEntradas - s.custoEntregas - s.totalSaidas;
+  }
 
-  // Registra fechamento no banco como movimentação
+  if (!confirm("Fechar o caixa desta sessão?\nIsso encerra a sessão e registra o fechamento.")) return;
+
+  await calcularFinanceiro(); // garante que _caixaState está atualizado
+  const s   = _caixaState;
+  const fmt = (n) => "Gs " + n.toLocaleString("es-PY");
+  const lucro = s.faturamento + s.totalEntradas - s.custoEntregas - s.totalSaidas;
+
   try {
-    await supa.from("movimentacoes_caixa").insert([
-      {
-        tipo: "fechamento",
-        valor: lucro,
-        descricao: `Fechamento ${new Date().toLocaleDateString("pt-BR")} | Fat: ${fmt(s.faturamento)} | Res: ${fmt(lucro)}`,
-        usuario_email:
-          document.getElementById("user-email")?.innerText || "admin",
-      },
-    ]);
+    // 1. Marca a sessão como fechada
+    await supa
+      .from("sessoes_caixa")
+      .update({
+        fechado_em:       new Date().toISOString(),
+        valor_fechamento: lucro,
+        observacao:       `Fat: ${fmt(s.faturamento)} | Res: ${fmt(lucro)}`,
+      })
+      .eq("id", _sessaoCaixaAtiva.id);
+
+    // 2. Registra movimentação de fechamento vinculada à sessão
+    await supa.from("movimentacoes_caixa").insert([{
+      tipo:          "fechamento",
+      valor:         lucro,
+      descricao:     `Fechamento ${new Date().toLocaleDateString("pt-BR")} | Fat: ${fmt(s.faturamento)} | Res: ${fmt(lucro)}`,
+      usuario_email: document.getElementById("user-email")?.innerText || "admin",
+      sessao_id:     _sessaoCaixaAtiva.id,
+    }]);
   } catch (e) {
     console.warn("Aviso fechamento:", e.message);
   }
 
-  alert(`📊 FECHAMENTO DO DIA
+  alert(`📊 FECHAMENTO DA SESSÃO #${_sessaoCaixaAtiva.id}
 ═══════════════════════════
 Faturamento Total: ${fmt(s.faturamento)}
 
@@ -2180,35 +2281,19 @@ Faturamento Total: ${fmt(s.faturamento)}
 💵 RESULTADO: ${fmt(lucro)}
 ═══════════════════════════
 ✅ Dinheiro na gaveta: ${fmt(s.totalEfetivo)}
-Fechamento registrado!`);
+Sessão encerrada!`);
 
-  // Zera os cards na tela
-  [
-    "card-faturamento",
-    "card-custo-moto",
-    "card-lucro",
-    "total-pix",
-    "total-transf",
-    "total-cartao",
-    "total-efetivo",
-    "card-ticket-medio",
-  ].forEach((id) => {
+  // Limpa estado
+  _sessaoCaixaAtiva = null;
+  ["card-faturamento","card-custo-moto","card-lucro","total-pix","total-transf",
+   "total-cartao","total-efetivo","card-ticket-medio"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.innerText = "Gs 0";
   });
   const qEl = document.getElementById("card-qtd-pedidos");
   if (qEl) qEl.innerText = "0";
-  _caixaState = {
-    faturamento: 0,
-    custoEntregas: 0,
-    totalSaidas: 0,
-    totalEntradas: 0,
-    totalPix: 0,
-    totalTransf: 0,
-    totalCartao: 0,
-    totalEfetivo: 0,
-    qtdPedidos: 0,
-  };
+  _caixaState = { faturamento:0, custoEntregas:0, totalSaidas:0, totalEntradas:0,
+                  totalPix:0, totalTransf:0, totalCartao:0, totalEfetivo:0, qtdPedidos:0 };
 }
 
 // =========================================
@@ -2755,20 +2840,24 @@ function previewUpload(input) {
 
 async function salvarProduto() {
   const btn = event.target;
-  btn.innerText = "Salvando...";
   btn.disabled = true;
   try {
     const id = document.getElementById("prod-id").value;
     const fileInput = document.getElementById("prod-img-file");
     let urlFinal = document.getElementById("prod-img").value;
 
+    // ── Upload para o Cloudinary (substitui Supabase Storage) ──
     if (fileInput.files.length > 0) {
-      const file = fileInput.files[0];
-      const nomeArq = Date.now() + "-" + file.name.replace(/\s+/g, "-");
-      await supa.storage.from("produtos").upload(nomeArq, file);
-      const { data } = supa.storage.from("produtos").getPublicUrl(nomeArq);
-      urlFinal = data.publicUrl;
+      btn.innerText = "Enviando imagem...";
+      try {
+        urlFinal = await uploadImageToCloudinary(fileInput.files[0]);
+      } catch (uploadErr) {
+        alert("❌ Falha no upload da imagem: " + uploadErr.message + "\nO produto não foi salvo.");
+        return;
+      }
     }
+
+    btn.innerText = "Salvando...";
 
     const tipo = document.getElementById("prod-tipo-builder").value || "padrao";
 
@@ -3772,25 +3861,31 @@ function _pizzaSaboresDragInit() {
 async function uploadSaborImagem(fileInput, row) {
   if (!fileInput.files.length) return;
   const file = fileInput.files[0];
-  const nomeArq = `sabores/${Date.now()}-${file.name.replace(/\s+/g, "-")}`;
   fileInput.disabled = true;
+
+  // Feedback visual no botão/label pai
+  const labelBtn = fileInput.closest("label");
+  const originalLabel = labelBtn ? labelBtn.innerHTML : null;
+  if (labelBtn) labelBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+
   try {
-    const { error } = await supa.storage.from("produtos").upload(nomeArq, file);
-    if (error) throw error;
-    const { data } = supa.storage.from("produtos").getPublicUrl(nomeArq);
+    // ── Upload para o Cloudinary (substitui Supabase Storage) ──
+    const url = await uploadImageToCloudinary(file);
+
     const inp =
       row.querySelector('[data-f="simg"]') ||
       row.querySelector('[data-f="img"]');
-    if (inp) inp.value = data.publicUrl;
+    if (inp) inp.value = url;
     const prev = row.querySelector("img.img-preview-mini");
     if (prev) {
-      prev.src = data.publicUrl;
+      prev.src = url;
       prev.style.display = "block";
     }
   } catch (e) {
     alert("Erro ao enviar imagem: " + e.message);
   } finally {
     fileInput.disabled = false;
+    if (labelBtn && originalLabel) labelBtn.innerHTML = originalLabel;
   }
 }
 
@@ -5900,15 +5995,14 @@ async function salvarBanner(num = 1) {
 
     if (fileInput?.files?.length) {
       const file = fileInput.files[0];
-      const nomeArq = `banner${suf}_${Date.now()}.${file.name.split(".").pop()}`;
-      const { error: uploadErr } = await supa.storage
-        .from("produtos")
-        .upload(nomeArq, file, { upsert: true });
-      if (uploadErr) throw uploadErr;
-      const { data: urlData } = supa.storage
-        .from("produtos")
-        .getPublicUrl(nomeArq);
-      urlFinal = urlData.publicUrl;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Enviando imagem...';
+      // ── Upload para o Cloudinary (substitui Supabase Storage) ──
+      try {
+        urlFinal = await uploadImageToCloudinary(file);
+      } catch (uploadErr) {
+        alert("❌ Falha no upload do banner: " + uploadErr.message + "\nO banner não foi salvo.");
+        return;
+      }
     }
 
     if (!urlFinal) {
@@ -6203,29 +6297,29 @@ async function salvarPersonalizacao() {
     // Upload do ícone se houver arquivo selecionado
     const iconeFile = document.getElementById("cfg-icone-file")?.files?.[0];
     if (iconeFile) {
-      const ext = iconeFile.name.split(".").pop();
-      const nomeArq = `icone-loja-${Date.now()}.${ext}`;
-      const { error: upErr } = await supa.storage
-        .from("produtos")
-        .upload(nomeArq, iconeFile, { upsert: true });
-      if (upErr) throw new Error("Erro no upload: " + upErr.message);
-      const { data: urlData } = supa.storage
-        .from("produtos")
-        .getPublicUrl(nomeArq);
-      dados.icone_url = urlData.publicUrl;
-      dados.logo_url = urlData.publicUrl;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Enviando ícone...';
+      // ── Upload para o Cloudinary (substitui Supabase Storage) ──
+      let iconeUrl;
+      try {
+        iconeUrl = await uploadImageToCloudinary(iconeFile);
+      } catch (uploadErr) {
+        alert("❌ Falha no upload do ícone: " + uploadErr.message + "\nA personalização não foi salva.");
+        return;
+      }
+      dados.icone_url = iconeUrl;
+      dados.logo_url = iconeUrl;
       // Atualiza preview
       const prev = document.getElementById("cfg-icone-preview");
       const box = document.getElementById("cfg-icone-preview-box");
       if (prev) {
-        prev.src = dados.icone_url;
+        prev.src = iconeUrl;
       }
       if (box) {
         box.style.display = "block";
       }
       // Preenche campo URL
       const urlInp = document.getElementById("cfg-logo-url");
-      if (urlInp) urlInp.value = dados.icone_url;
+      if (urlInp) urlInp.value = iconeUrl;
     }
 
     if (Object.keys(dados).length > 0) {
@@ -6256,16 +6350,8 @@ async function _uploadLogoIdentidade(input) {
   if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Enviando...';
 
   try {
-    const ext = file.name.split(".").pop();
-    const nomeArq = `logo-${Date.now()}.${ext}`;
-    const { error: upErr } = await supa.storage
-      .from("produtos")
-      .upload(nomeArq, file, { upsert: true });
-    if (upErr) throw upErr;
-    const { data: urlData } = supa.storage
-      .from("produtos")
-      .getPublicUrl(nomeArq);
-    const url = urlData.publicUrl;
+    // ── Upload para o Cloudinary (substitui Supabase Storage) ──
+    const url = await uploadImageToCloudinary(file);
 
     // Preenche o campo de URL de texto
     const urlInput = document.getElementById("cfg-logo-url");
@@ -6584,6 +6670,172 @@ async function logout() {
   const { error } = await supa.auth.signOut();
   if (error) alert("Erro ao sair: " + error.message);
   else window.location.href = "login.html";
+}
+
+// ─────────────────────────────────────────────────────────────
+// ALTERAR SENHA
+// ─────────────────────────────────────────────────────────────
+function abrirModalAlterarSenha() {
+  const html = `
+    <div id="modal-alterar-senha" class="modal-overlay" style="display:flex;z-index:9999;backdrop-filter:blur(4px)">
+      <div style="background:#fff;border-radius:20px;width:100%;max-width:420px;
+        box-shadow:0 24px 60px rgba(0,0,0,0.18);overflow:hidden;font-family:inherit">
+        <!-- Header -->
+        <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#1a7a2e 100%);
+          padding:24px 24px 20px;position:relative">
+          <button onclick="document.getElementById('modal-alterar-senha').remove()"
+            style="position:absolute;top:14px;right:16px;background:rgba(255,255,255,0.12);
+            border:none;color:#fff;width:30px;height:30px;border-radius:50%;font-size:14px;
+            cursor:pointer">✕</button>
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="background:rgba(255,255,255,0.12);border-radius:12px;padding:10px;font-size:22px">🔐</div>
+            <div>
+              <div style="color:#fff;font-size:1.1rem;font-weight:700">Alterar Senha</div>
+              <div style="color:rgba(255,255,255,0.55);font-size:0.78rem;margin-top:2px">Escolha uma senha forte</div>
+            </div>
+          </div>
+        </div>
+        <!-- Body -->
+        <div style="padding:22px 24px 18px">
+          <div style="margin-bottom:16px">
+            <label style="font-size:0.75rem;font-weight:600;color:#64748b;text-transform:uppercase;
+              letter-spacing:.4px;display:block;margin-bottom:6px">Nova senha</label>
+            <div style="position:relative">
+              <input type="password" id="wl-nova-senha" placeholder="Digite a nova senha"
+                autocomplete="new-password" oninput="_wlAvaliarSenha(this.value)"
+                style="width:100%;padding:10px 42px 10px 13px;border:2px solid #e2e8f0;
+                border-radius:10px;font-size:0.9rem;outline:none;box-sizing:border-box"
+                onfocus="this.style.borderColor='#1a7a2e'" onblur="this.style.borderColor='#e2e8f0'"/>
+              <span onclick="_wlToggleSenha('wl-nova-senha','wl-eye1')" id="wl-eye1"
+                style="position:absolute;right:11px;top:50%;transform:translateY(-50%);
+                cursor:pointer;font-size:17px;user-select:none">👁</span>
+            </div>
+            <!-- Barra de força -->
+            <div style="margin-top:7px">
+              <div style="display:flex;gap:4px;height:5px;border-radius:4px;overflow:hidden">
+                <div id="wl-b1" style="flex:1;background:#e2e8f0;border-radius:4px;transition:background .3s"></div>
+                <div id="wl-b2" style="flex:1;background:#e2e8f0;border-radius:4px;transition:background .3s"></div>
+                <div id="wl-b3" style="flex:1;background:#e2e8f0;border-radius:4px;transition:background .3s"></div>
+                <div id="wl-b4" style="flex:1;background:#e2e8f0;border-radius:4px;transition:background .3s"></div>
+              </div>
+              <div id="wl-forca-lbl" style="font-size:0.72rem;color:#aaa;margin-top:4px;min-height:14px"></div>
+            </div>
+            <!-- Critérios -->
+            <div style="margin-top:9px;display:grid;grid-template-columns:1fr 1fr;gap:3px 10px">
+              <div id="wl-c1" style="font-size:.72rem;color:#bbb;transition:color .25s">✗ Mín. 8 caracteres</div>
+              <div id="wl-c2" style="font-size:.72rem;color:#bbb;transition:color .25s">✗ Número</div>
+              <div id="wl-c3" style="font-size:.72rem;color:#bbb;transition:color .25s">✗ Maiúscula</div>
+              <div id="wl-c4" style="font-size:.72rem;color:#bbb;transition:color .25s">✗ Caractere especial</div>
+            </div>
+          </div>
+          <div style="margin-bottom:6px">
+            <label style="font-size:0.75rem;font-weight:600;color:#64748b;text-transform:uppercase;
+              letter-spacing:.4px;display:block;margin-bottom:6px">Confirmar senha</label>
+            <div style="position:relative">
+              <input type="password" id="wl-conf-senha" placeholder="Repita a nova senha"
+                autocomplete="new-password" oninput="_wlVerificarMatch()"
+                style="width:100%;padding:10px 42px 10px 13px;border:2px solid #e2e8f0;
+                border-radius:10px;font-size:0.9rem;outline:none;box-sizing:border-box"
+                onfocus="this.style.borderColor='#1a7a2e'" onblur="this.style.borderColor='#e2e8f0'"/>
+              <span onclick="_wlToggleSenha('wl-conf-senha','wl-eye2')" id="wl-eye2"
+                style="position:absolute;right:11px;top:50%;transform:translateY(-50%);
+                cursor:pointer;font-size:17px;user-select:none">👁</span>
+            </div>
+            <div id="wl-match-lbl" style="font-size:0.78rem;margin-top:5px;min-height:16px"></div>
+          </div>
+          <div id="wl-msg-senha" style="display:none;color:#e74c3c;font-size:0.82rem;
+            background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:8px 12px;margin-top:10px"></div>
+        </div>
+        <!-- Footer -->
+        <div style="padding:0 24px 22px;display:flex;gap:10px">
+          <button onclick="document.getElementById('modal-alterar-senha').remove()"
+            style="flex:1;padding:11px;background:#f5f5f5;color:#666;border:none;border-radius:10px;
+            font-size:0.88rem;font-weight:600;cursor:pointer">Cancelar</button>
+          <button id="wl-btn-salvar-senha" onclick="wlSalvarNovaSenha()"
+            style="flex:2;padding:11px;background:linear-gradient(135deg,#1a7a2e,#145a22);
+            color:#fff;border:none;border-radius:10px;font-size:0.88rem;font-weight:700;cursor:pointer">
+            🔒 Salvar Nova Senha
+          </button>
+        </div>
+      </div>
+    </div>`;
+  const old = document.getElementById("modal-alterar-senha");
+  if (old) old.remove();
+  document.body.insertAdjacentHTML("beforeend", html);
+  setTimeout(() => document.getElementById("wl-nova-senha")?.focus(), 120);
+}
+
+function _wlToggleSenha(inputId, spanId) {
+  const inp = document.getElementById(inputId);
+  const sp  = document.getElementById(spanId);
+  if (!inp) return;
+  inp.type = inp.type === "password" ? "text" : "password";
+  if (sp) sp.textContent = inp.type === "password" ? "👁" : "🙈";
+}
+
+function _wlAvaliarSenha(v) {
+  const checks = [v.length >= 8, /\d/.test(v), /[A-Z]/.test(v), /[^A-Za-z0-9]/.test(v)];
+  const txts   = ["Mín. 8 caracteres","Número","Maiúscula","Caractere especial"];
+  const cores  = ["#e2e8f0","#ef4444","#f97316","#eab308","#22c55e"];
+  const labels = ["","Fraca 😬","Razoável 😐","Boa 👍","Forte 💪"];
+  const score  = checks.filter(Boolean).length;
+
+  checks.forEach((ok, i) => {
+    const el = document.getElementById("wl-c" + (i + 1));
+    if (!el) return;
+    el.textContent = (ok ? "✓ " : "✗ ") + txts[i];
+    el.style.color = ok ? "#22c55e" : "#bbb";
+  });
+  for (let i = 1; i <= 4; i++) {
+    const b = document.getElementById("wl-b" + i);
+    if (b) b.style.background = i <= score ? cores[score] : "#e2e8f0";
+  }
+  const fl = document.getElementById("wl-forca-lbl");
+  if (fl) { fl.textContent = labels[score]; fl.style.color = cores[score]; }
+  _wlVerificarMatch();
+}
+
+function _wlVerificarMatch() {
+  const a   = document.getElementById("wl-nova-senha")?.value || "";
+  const b   = document.getElementById("wl-conf-senha")?.value || "";
+  const lbl = document.getElementById("wl-match-lbl");
+  const inp = document.getElementById("wl-conf-senha");
+  if (!lbl || !b) return;
+  const ok = a === b && b.length > 0;
+  lbl.textContent = ok ? "✓ Senhas coincidem" : "✗ Senhas não coincidem";
+  lbl.style.color = ok ? "#22c55e" : "#ef4444";
+  if (inp) inp.style.borderColor = b.length > 0 ? (ok ? "#22c55e" : "#ef4444") : "#e2e8f0";
+}
+
+async function wlSalvarNovaSenha() {
+  const nova   = document.getElementById("wl-nova-senha")?.value || "";
+  const conf   = document.getElementById("wl-conf-senha")?.value || "";
+  const msgEl  = document.getElementById("wl-msg-senha");
+  const showErr = (t) => { msgEl.textContent = t; msgEl.style.display = "block"; };
+  msgEl.style.display = "none";
+
+  if (nova.length < 6)  return showErr("A senha deve ter pelo menos 6 caracteres.");
+  if (nova !== conf)    return showErr("As senhas não coincidem.");
+
+  const btn = document.getElementById("wl-btn-salvar-senha");
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Salvando..."; btn.style.opacity = ".7"; }
+
+  const { error } = await supa.auth.updateUser({ password: nova });
+
+  if (btn) { btn.disabled = false; btn.textContent = "🔒 Salvar Nova Senha"; btn.style.opacity = "1"; }
+
+  if (error) {
+    showErr("Erro: " + error.message);
+  } else {
+    document.getElementById("modal-alterar-senha").remove();
+    const toast = document.createElement("div");
+    toast.textContent = "✅ Senha alterada com sucesso!";
+    toast.style.cssText = "position:fixed;bottom:28px;left:50%;transform:translateX(-50%);" +
+      "background:#1a7a2e;color:#fff;padding:12px 24px;border-radius:12px;font-weight:600;" +
+      "font-size:0.9rem;z-index:99999;box-shadow:0 8px 24px rgba(0,0,0,0.2)";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 3200);
+  }
 }
 
 // =========================================
