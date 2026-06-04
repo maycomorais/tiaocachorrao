@@ -524,17 +524,22 @@ async function verificarHorario() {
 
 // ── Auto-scroll do modal ao revelar nova seção ───────────────────────────────
 // Rola a área de scroll do modal até deixar `el` visível com espaço no topo.
-function _scrollModalParaElemento(el) {
+function _scrollModalParaElemento(el, delay = 0) {
   if (!el) return;
   const area = document.querySelector(".modal-scroll-area");
   if (!area) return;
-  // Pequeno delay para o browser ter renderizado o elemento antes de medir
-  requestAnimationFrame(() => {
-    const areaRect = area.getBoundingClientRect();
-    const elRect   = el.getBoundingClientRect();
-    const offset   = elRect.top - areaRect.top + area.scrollTop - 16; // 16px de respiro
-    area.scrollTo({ top: offset, behavior: "smooth" });
-  });
+  // Double rAF: 1º aguarda render, 2º aguarda layout/repaint completo
+  const doScroll = () => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const areaRect = area.getBoundingClientRect();
+        const elRect   = el.getBoundingClientRect();
+        const offset   = elRect.top - areaRect.top + area.scrollTop - 16;
+        area.scrollTo({ top: offset, behavior: "smooth" });
+      });
+    });
+  };
+  delay > 0 ? setTimeout(doScroll, delay) : doScroll();
 }
 
 // ── Filtra opções de pagamento no checkout conforme features_ativas.pagamentos ──
@@ -835,6 +840,11 @@ let _shakeConfig  = { tamanho: null, sabor: null };
 let _sorveteConfig = { tamanho: null, sabores: [], etapasSel: {} };
 let _acaiConfig   = { tamanho: null, etapasSel: {}, variacao: null };
 let _sucoConfig   = { tamanho: null, etapasSel: {} };
+let _comboFechadoConfig = {
+  limite: 0,       // limite_total do montagem_config
+  sabores: [],     // array de { id, nome }
+  selecao: {},     // { [id]: quantidade }
+};
 
 function abrirModal(item) {
   prodAtual = item;
@@ -851,6 +861,7 @@ function abrirModal(item) {
   _sorveteConfig = { tamanho: null, sabores: [], etapasSel: {} };
   _acaiConfig    = { tamanho: null, etapasSel: {}, variacao: null };
   _sucoConfig    = { tamanho: null, etapasSel: {} };
+  _comboFechadoConfig = { limite: 0, sabores: [], selecao: {} };
 
   document.getElementById("modal-title").innerText = item.nome;
   document.getElementById("modal-desc").innerText = item.desc || "";
@@ -892,7 +903,10 @@ function abrirModal(item) {
     _renderAcai(cfg, divOptions);
   } else if (tipo === "suco") {
     _renderSuco(cfg, divOptions);
+  } else if (tipo === "combo_fechado") {
+    _renderComboFechado(cfg, divOptions);
   }
+
 
   // Extras do produto específico
   const extras = cfg && cfg.extras ? cfg.extras : null;
@@ -1113,45 +1127,62 @@ function _selecionarDivisao(n) {
     </p>`;
 
   for (let slot = 0; slot < n; slot++) {
-    const fracLabel =
-      n === 1 ? "" : `<span class="pizza-fracao-badge">${slot + 1}/${n}</span>`;
+    const fracLabel = n === 1 ? '' : `<span class="pizza-fracao-badge">${slot + 1}/${n}</span>`;
     html += `
     <div class="pizza-slot-header">
       ${fracLabel}
-      <span class="pizza-slot-label">${n === 1 ? "Sabor" : `${slot + 1}º sabor`}</span>
+      <span class="pizza-slot-label">${n === 1 ? 'Sabor' : `${slot + 1}º sabor`}</span>
     </div>
     <div class="pizza-sabores-lista" id="pizza-slot-${slot}">
-      ${saboresFiltrados
-        .map((s) => {
-          const sfEsc = (s.nome || "").replace(/'/g, "\\'");
-          // Tipo → badge colorido
-          const tipoBadgeClass = {
-            "doce":     "tipo-doce",
-            "especial": "tipo-especial",
-            "premium":  "tipo-premium",
-            "vegano":   "tipo-vegano",
-            "picante":  "tipo-picante",
-          }[(s.tipo || "").toLowerCase()] || "tipo-default";
-          const tipoBadge = s.tipo
-            ? `<span class="pizza-sabor-tipo-badge ${tipoBadgeClass}">${s.tipo}</span>`
-            : "";
-          // Preço: premium (>0) → mostra "+Gs X"; incluso (0) → "Incluso" se houver mix
-          const temPremium = (p.sabores || []).some(sb => (sb.preco || 0) > 0);
-          const precoLabel = (s.preco || 0) > 0
-            ? `<span class="pizza-sabor-preco pizza-sabor-preco--premium">+Gs ${s.preco.toLocaleString("es-PY")}</span>`
-            : (temPremium ? `<span class="pizza-sabor-preco pizza-sabor-preco--incluso">Incluso</span>` : "");
-          const descHtml = s.desc ? `<div class="pizza-sabor-desc">${s.desc}</div>` : "";
-          return `<button type="button" class="pizza-sabor-item" data-slot="${slot}" data-nome="${s.nome}" data-preco="${s.preco || 0}" onclick="_selecionarSaborSlot(${slot}, '${sfEsc}', ${s.preco || 0}, this)">
-          ${s.img ? `<img src="${s.img}" class="pizza-sabor-img" alt="${s.nome}">` : `<div class="pizza-sabor-emoji">🍕</div>`}
+      ${saboresFiltrados.map((s) => {
+        const sfEsc = (s.nome || '').replace(/'/g, "\\'");
+        const tipoEsc = (s.tipo || '').replace(/'/g, "\\'");
+
+        // ── Badge de tipo (igual referência) ──────────────────────
+        const tipoLower = (s.tipo || '').toLowerCase().replace(/\s+/g, '-');
+        const tipoBadgeMap = {
+          'especial':      '⭐ Especial',
+          'premium':       '💎 Premium',
+          'doce-premium':  '🎂 Doce Premium',
+          'doce':          '🍫 Doce',
+          'vegano':        '🌱 Vegano',
+          'picante':       '🌶️ Picante',
+        };
+        const tipoBadgeClass = tipoLower
+          ? `tipo-${tipoLower.replace(/\s/g,'-').replace(/[^a-z-]/g,'')}`
+          : '';
+        const tipoBadgeLabel = tipoBadgeMap[tipoLower] || (s.tipo || '');
+        const tipoBadge = s.tipo
+          ? `<span class="pizza-sabor-tipo-badge ${tipoBadgeClass}">${tipoBadgeLabel}</span>`
+          : '';
+
+        // ── Preço diferencial vs. o tipo mais barato do tamanho ──
+        // Mostra "+Gs X.XXX" só quando há diferença de preço entre tipos
+        const tamAtual = _pizzaConfig.tamanhoSelecionado;
+        const precoEste  = tamAtual ? _precoPizzaPorTipo(tamAtual, s.tipo) : 0;
+        const precoBase  = tamAtual ? _precoBasePorTipo(tamAtual) : 0;
+        const precoDiff  = precoEste - precoBase;
+        const precoLabel = precoDiff > 0
+          ? `<div class="pizza-sabor-preco">+ Gs ${precoDiff.toLocaleString('es-PY')}</div>`
+          : '';
+
+        // ── Descrição ─────────────────────────────────────────────
+        const descHtml = s.desc ? `<div class="pizza-sabor-desc">${s.desc}</div>` : '';
+
+        return `<button type="button" class="pizza-sabor-item"
+            data-slot="${slot}" data-nome="${s.nome}" data-tipo="${tipoEsc}"
+            onclick="_selecionarSaborSlot(${slot}, '${sfEsc}', 0, this, '${tipoEsc}')">
+          ${s.img
+            ? `<img src="${s.img}" class="pizza-sabor-img" alt="${s.nome}" onerror="this.style.display='none'" loading="lazy">`
+            : `<div class="pizza-sabor-emoji">🍕</div>`}
           <div class="pizza-sabor-info">
-            <div class="pizza-sabor-header-row">${tipoBadge}</div>
             <div class="pizza-sabor-nome">${s.nome}</div>
             ${descHtml}
             ${precoLabel}
           </div>
+          ${tipoBadge}
         </button>`;
-        })
-        .join("")}
+      }).join('')}
     </div>`;
   }
   html += `</section>`;
@@ -1169,33 +1200,42 @@ function _selecionarDivisao(n) {
   _atualizarPrecoPizza();
 }
 
-function _selecionarSaborSlot(slot, nome, preco, el) {
+function _selecionarSaborSlot(slot, nome, preco, el, tipo) {
+  tipo = tipo || el?.dataset?.tipo || '';
   // Desmarca outros no mesmo slot
   const lista = document.getElementById(`pizza-slot-${slot}`);
-  if (lista)
-    lista.querySelectorAll(".pizza-sabor-item").forEach((b) => {
-      b.classList.remove("selected");
-      b.querySelector(".pizza-fracao-tag")?.remove();
-    });
+  if (lista) lista.querySelectorAll('.pizza-sabor-item').forEach((b) => {
+    b.classList.remove('selected');
+    b.querySelector('.pizza-fracao-tag')?.remove();
+  });
 
-  el.classList.add("selected");
+  el.classList.add('selected');
   const n = _pizzaConfig.numSabores || 1;
-  // Adiciona tag de fração
-  const tag = document.createElement("span");
-  tag.className = "pizza-fracao-tag";
-  tag.textContent = n > 1 ? `${slot + 1}/${n}` : "✓";
+  const tag = document.createElement('span');
+  tag.className = 'pizza-fracao-tag';
+  tag.textContent = n > 1 ? `${slot + 1}/${n}` : '✓';
   el.appendChild(tag);
 
-  _pizzaConfig.sabores[slot] = { nome, preco };
+  // Salva tipo para cálculo correto de preço por tipo
+  _pizzaConfig.sabores[slot] = { nome, preco: 0, tipo };
 
-  // Verifica se todos slots preenchidos → mostra borda
   const cheios = _pizzaConfig.sabores.filter(Boolean).length;
   if (cheios >= n) {
     _revelarPasso4Borda();
+    // Scroll para a borda após ela ser inserida no DOM
+    setTimeout(() => {
+      const p4 = document.getElementById("pizza-passo4");
+      if (p4) _scrollModalParaElemento(p4);
+    }, 60);
   } else {
-    // Scroll para o próximo slot ainda vazio
-    const proximoSlot = document.getElementById(`pizza-slot-${slot + 1}`);
-    if (proximoSlot) _scrollModalParaElemento(proximoSlot.closest("section") || proximoSlot);
+    // Scroll para o próximo slot com pequeno delay para o layout estabilizar
+    setTimeout(() => {
+      const header = document.querySelector(`#pizza-slot-${slot + 1}`)
+                              ?.closest(".pizza-sabores-lista")
+                              ?.previousElementSibling; // .pizza-slot-header
+      const alvo = header || document.getElementById(`pizza-slot-${slot + 1}`);
+      if (alvo) _scrollModalParaElemento(alvo);
+    }, 60);
   }
   _atualizarPrecoPizza();
   _atualizarResumo();
@@ -1263,52 +1303,248 @@ function _atualizarResumo() {
   const el = document.getElementById("pizza-resumo");
   if (!el) return;
   const saboresOk = (_pizzaConfig.sabores || []).filter(Boolean);
-  if (saboresOk.length === 0) {
-    el.style.display = "none";
-    return;
-  }
+  if (saboresOk.length === 0) { el.style.display = "none"; return; }
 
-  // Preço base = tamanho (é sempre o preço principal da pizza)
-  // Sabor premium (s.preco > 0) adiciona diferença sobre o tamanho
-  const tamPreco = _pizzaConfig.tamanhoSelecionado?.preco || 0;
-  const saborExtra = saboresOk.reduce(
-    (acc, s) => Math.max(acc, s.preco || 0),
-    0,
-  );
-  const precoBase = tamPreco + (saborExtra > 0 ? saborExtra : 0);
+  const tipoIcons = {
+    "tradicional": "🍕", "salgada": "🍕", "especial": "⭐",
+    "premium": "💎", "doce premium": "🎂", "doce": "🍫",
+    "vegano": "🌱", "picante": "🌶️",
+  };
+  const n          = _pizzaConfig.numSabores || 1;
+  const tam        = _pizzaConfig.tamanhoSelecionado;
+  const precoBase  = _calcularBasePizza(tam, saboresOk);
   const precoBorda = _pizzaConfig.bordaConfig?.preco || 0;
-  const tam = _pizzaConfig.tamanhoSelecionado;
 
-  el.style.display = "block";
-  const n = _pizzaConfig.numSabores || 1;
-  // Sabor mais caro prevalece — mostra qual definiu o preço
-  const precoMaisCaro = Math.max(...saboresOk.map(s => s.preco || 0));
-  const saboresLinhas = saboresOk.map((s, i) => {
-    const frac = n > 1 ? `${i + 1}/${n} ` : "";
-    const ehOmaisCaro = n > 1 && (s.preco || 0) === precoMaisCaro && precoMaisCaro > 0;
-    const precoTag = (s.preco || 0) > 0
-      ? `<span style="font-size:0.7rem;background:var(--primary);color:#fff;padding:1px 6px;border-radius:8px;margin-left:4px">+Gs ${s.preco.toLocaleString("es-PY")}${ehOmaisCaro ? " ★" : ""}</span>`
+  const linhasSabores = saboresOk.map((s, i) => {
+    const tl   = (s.tipo || "").toLowerCase();
+    const icon = tipoIcons[tl] || "🍕";
+    const tipoTag = s.tipo
+      ? ` <span style="font-size:.75em;opacity:.65">(${s.tipo})</span>`
       : "";
     return `<div class="pizza-resumo-linha">
-      <span>${frac}Sabor</span>
-      <span>${s.nome}${precoTag}</span>
+      <span>${n > 1 ? `${i+1}/${n} Sabor` : "Sabor"}</span>
+      <span>${icon} ${s.nome}${tipoTag}</span>
     </div>`;
   }).join("");
 
-  // Nota quando sabor mais caro prevalece em pizza dividida
-  const notaPrev = n > 1 && precoMaisCaro > 0
-    ? `<div style="font-size:0.68rem;color:#888;padding:4px 14px;background:#fffbf0;border-top:1px solid #fde8d0">
-         ★ Prevalece o preço do sabor mais caro
+  const notaPreco = n > 1 && saboresOk.some(s => s.tipo)
+    ? `<div style="font-size:.68rem;color:#888;padding:4px 14px;background:#fffbf0">
+         ★ Prevalece o preço do tipo mais caro
        </div>`
     : "";
 
+  el.style.display = "block";
   el.innerHTML = `
     <div class="pizza-resumo-header">🍕 Resumo da sua pizza</div>
-    ${tam ? `<div class="pizza-resumo-linha"><span>Tamanho</span><span>${tam.nome}${tam.fatias ? ` (${tam.fatias} fatias` : ""}${tam.cm ? ` · ⌀${tam.cm}cm` : ""}${tam.fatias ? ")" : ""}</span></div>` : ""}
-    ${saboresLinhas}
+    ${tam ? `<div class="pizza-resumo-linha"><span>Tamanho</span><span>${tam.nome}${tam.fatias ? ` (${tam.fatias} fatias · ⌀${tam.cm}cm)` : ""}</span></div>` : ""}
+    ${linhasSabores}
     ${_pizzaConfig.bordaConfig ? `<div class="pizza-resumo-linha"><span>Borda</span><span>${_pizzaConfig.bordaConfig.nome}</span></div>` : ""}
-    ${notaPrev}
+    ${notaPreco}
     <div class="pizza-resumo-total"><span>Total</span><span>Gs ${((precoBase + precoBorda) * (qtd || 1)).toLocaleString("es-PY")}</span></div>`;
+}
+
+// ══════════════════════════════════════════════════════════
+//  Pizza: preço por tipo de sabor
+//  Schema do projeto: tam.precos = { "Tradicional": 50000, "Especial": 60000, ... }
+//  Fallback: tam.preco (mínimo calculado no save)
+// ══════════════════════════════════════════════════════════
+function _precoPizzaPorTipo(tam, tipo) {
+  if (!tam) return 0;
+  // tam.precos é o mapa tipo→preço salvo pelo admin
+  const precos = tam.precos || {};
+  // Tenta exato primeiro, depois case-insensitive
+  if (tipo && precos[tipo] > 0) return precos[tipo];
+  if (tipo) {
+    const chave = Object.keys(precos).find(k => k.toLowerCase() === tipo.toLowerCase());
+    if (chave && precos[chave] > 0) return precos[chave];
+  }
+  // Fallback: preco mínimo do tamanho
+  return tam.preco || 0;
+}
+
+// Retorna o preço base da pizza = máximo entre os tipos dos sabores selecionados
+// (regra do sabor mais caro prevalecer na pizza dividida)
+function _calcularBasePizza(tam, saboresOk) {
+  if (!tam || saboresOk.length === 0) return tam ? (tam.preco || 0) : 0;
+  return Math.max(...saboresOk.map(s => _precoPizzaPorTipo(tam, s.tipo)));
+}
+
+// Preço mais barato entre todos os tipos disponíveis neste tamanho
+// (usado para calcular diferencial a exibir no card de cada sabor)
+function _precoBasePorTipo(tam) {
+  if (!tam) return 0;
+  const precos = tam.precos || {};
+  const vals = Object.values(precos).filter(v => v > 0);
+  return vals.length ? Math.min(...vals) : (tam.preco || 0);
+}
+
+function _renderComboFechado(cfg, container) {
+  if (!cfg || cfg.__tipo !== "combo_fechado") return;
+ 
+  const limite = cfg.limite_total || 0;
+  const sabores = cfg.sabores || [];
+ 
+  // Inicializa estado global
+  _comboFechadoConfig.limite  = limite;
+  _comboFechadoConfig.sabores = sabores;
+  _comboFechadoConfig.selecao = {};
+  sabores.forEach((s) => (_comboFechadoConfig.selecao[s.id] = 0));
+ 
+  // ── Wrapper principal ──────────────────────────────────────
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "padding:4px 0";
+ 
+  // Instrução
+  const instrucao = document.createElement("p");
+  instrucao.style.cssText =
+    "font-size:0.85rem;color:#64748b;margin:0 0 12px;line-height:1.45";
+  instrucao.textContent = `Distribua ${limite} ${limite === 1 ? "item" : "itens"} entre os sabores disponíveis.`;
+  wrap.appendChild(instrucao);
+ 
+  // ── Contador global ────────────────────────────────────────
+  const contador = document.createElement("div");
+  contador.id = "combo-contador";
+  contador.style.cssText =
+    "font-size:0.85rem;font-weight:600;color:#475569;text-align:center;" +
+    "padding:8px 12px;background:#f8fafc;border:1.5px solid #e2e8f0;" +
+    "border-radius:8px;margin-bottom:12px;transition:background .2s,color .2s,border-color .2s";
+  contador.textContent = `0 / ${limite} selecionados`;
+  wrap.appendChild(contador);
+ 
+  // ── Lista de sabores ───────────────────────────────────────
+  const lista = document.createElement("div");
+  lista.style.cssText =
+    "border:1px solid #f1f5f9;border-radius:10px;overflow:hidden";
+ 
+  sabores.forEach((sabor) => {
+    const row = document.createElement("div");
+    row.style.cssText =
+      "display:flex;align-items:center;justify-content:space-between;" +
+      "gap:12px;padding:11px 14px;border-bottom:1px solid #f1f5f9;background:#fff";
+ 
+    // Nome do sabor
+    const nome = document.createElement("span");
+    nome.textContent = sabor.nome;
+    nome.style.cssText = "flex:1;font-size:0.95rem;color:#1e293b;font-weight:500";
+ 
+    // Stepper
+    const stepper = document.createElement("div");
+    stepper.style.cssText =
+      "display:flex;align-items:center;gap:0;border:1.5px solid #e5e7eb;" +
+      "border-radius:8px;overflow:hidden;flex-shrink:0";
+ 
+    const btnDec = document.createElement("button");
+    btnDec.type    = "button";
+    btnDec.dataset.btnDec = sabor.id;
+    btnDec.textContent = "−";
+    btnDec.style.cssText =
+      "width:34px;height:34px;background:#f8fafc;border:none;font-size:1.1rem;" +
+      "font-weight:700;cursor:pointer;color:#374151;line-height:1";
+    btnDec.disabled = true;
+    btnDec.onclick  = () => _cfDecrementar(sabor.id);
+ 
+    const qty = document.createElement("span");
+    qty.id = "cf-qty-" + sabor.id;
+    qty.textContent = "0";
+    qty.style.cssText =
+      "min-width:36px;text-align:center;font-size:0.95rem;font-weight:700;" +
+      "color:#1e293b;padding:0 4px;background:#fff;" +
+      "border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;line-height:34px";
+ 
+    const btnInc = document.createElement("button");
+    btnInc.type    = "button";
+    btnInc.dataset.btnInc = sabor.id;
+    btnInc.textContent = "+";
+    btnInc.style.cssText =
+      "width:34px;height:34px;background:#f8fafc;border:none;font-size:1.1rem;" +
+      "font-weight:700;cursor:pointer;color:#374151;line-height:1";
+    btnInc.onclick = () => _cfIncrementar(sabor.id);
+ 
+    stepper.appendChild(btnDec);
+    stepper.appendChild(qty);
+    stepper.appendChild(btnInc);
+ 
+    row.appendChild(nome);
+    row.appendChild(stepper);
+    lista.appendChild(row);
+  });
+ 
+  // Remove borda inferior do último item
+  const lastRow = lista.lastElementChild;
+  if (lastRow) lastRow.style.borderBottom = "none";
+ 
+  wrap.appendChild(lista);
+  container.appendChild(wrap);
+ 
+  // Desabilita o botão "Adicionar" do modal até completar a seleção
+  _cfAtualizarUI();
+}
+
+/* Incrementa a quantidade de um sabor */
+function _cfIncrementar(id) {
+  const sel   = _comboFechadoConfig.selecao;
+  const total = Object.values(sel).reduce((a, b) => a + b, 0);
+  if (total >= _comboFechadoConfig.limite) return;
+  if (!(id in sel)) return;
+  sel[id]++;
+  _cfAtualizarUI();
+}
+
+/* Decrementa a quantidade de um sabor */
+function _cfDecrementar(id) {
+  const sel = _comboFechadoConfig.selecao;
+  if (!(id in sel) || sel[id] <= 0) return;
+  sel[id]--;
+  _cfAtualizarUI();
+}
+
+/* Sincroniza toda a UI do combo fechado */
+function _cfAtualizarUI() {
+  const sel    = _comboFechadoConfig.selecao;
+  const limite = _comboFechadoConfig.limite;
+  const total  = Object.values(sel).reduce((a, b) => a + b, 0);
+  const cheio  = total >= limite;
+  const exato  = total === limite;
+
+  Object.entries(sel).forEach(([id, qty]) => {
+    const el = document.getElementById("cf-qty-" + id);
+    if (el) el.textContent = qty;
+  });
+
+  const contador = document.getElementById("combo-contador");
+  if (contador) {
+    contador.textContent = `${total} / ${limite} selecionados`;
+    if (exato) {
+      contador.style.background  = "#f0fdf4";
+      contador.style.borderColor = "#86efac";
+      contador.style.color       = "#166534";
+    } else {
+      contador.style.background  = "#f8fafc";
+      contador.style.borderColor = "#e2e8f0";
+      contador.style.color       = "#475569";
+    }
+  }
+
+  document.querySelectorAll("[data-btn-inc]").forEach((btn) => {
+    btn.disabled = cheio;
+    btn.style.color  = cheio ? "#cbd5e1" : "#374151";
+    btn.style.cursor = cheio ? "not-allowed" : "pointer";
+  });
+
+  document.querySelectorAll("[data-btn-dec]").forEach((btn) => {
+    const id  = btn.dataset.btnDec;
+    const qty = sel[id] || 0;
+    btn.disabled = qty <= 0;
+    btn.style.color  = qty <= 0 ? "#cbd5e1" : "#374151";
+    btn.style.cursor = qty <= 0 ? "not-allowed" : "pointer";
+  });
+
+  const btnAdd = document.querySelector(".btn-add");
+  if (btnAdd) {
+    btnAdd.disabled      = !exato;
+    btnAdd.style.opacity = exato ? "1" : "0.45";
+    btnAdd.style.cursor  = exato ? "pointer" : "not-allowed";
+  }
 }
 
 function _atualizarPrecoPizza() {
@@ -1371,15 +1607,8 @@ function _atualizarPrecoPizza() {
     return;
   }
   const saboresOk = (_pizzaConfig.sabores || []).filter(Boolean);
-  const tam      = _pizzaConfig.tamanhoSelecionado;
-  const tipoSel  = _pizzaConfig.tipoSelecionado;
-  // Preço do tamanho: prefere o do tipo selecionado se existir
-  const tamPreco = (tipoSel && tam?.precos?.[tipoSel])
-    ? tam.precos[tipoSel]
-    : (tam?.preco || prodAtual?.preco || 0);
-  // Prevalecer o sabor mais caro (regra de ouro da pizza dividida)
-  const saborMaisCaro = saboresOk.reduce((acc, s) => Math.max(acc, s.preco || 0), 0);
-  const precoBase  = tamPreco + saborMaisCaro;
+  const tam       = _pizzaConfig.tamanhoSelecionado;
+  const precoBase  = _calcularBasePizza(tam, saboresOk.length ? saboresOk : []) || prodAtual?.preco || 0;
   const precoBorda = _pizzaConfig.bordaConfig?.preco || 0;
   const total = (precoBase + precoBorda + extrasTotal) * qtd;
   document.getElementById("modal-price").innerText =
@@ -2072,11 +2301,25 @@ function adicionarDoModal() {
   if (tipo === "sorvete" && !_sorveteConfig.tamanho) { alert("Selecione o tamanho!"); return; }
   if (tipo === "acai"    && !_acaiConfig.tamanho)    { alert("Selecione o tamanho!"); return; }
   if (tipo === "suco"    && !_sucoConfig.tamanho)    { alert("Selecione o tamanho!"); return; }
+  if (tipo === "combo_fechado") {
+    const total = Object.values(_comboFechadoConfig.selecao).reduce((a, b) => a + b, 0);
+    if (total !== _comboFechadoConfig.limite) {
+      alert(`Selecione exatamente ${_comboFechadoConfig.limite} itens para continuar.`);
+      return;
+    }
+  }
 
   // Monta descrição para o carrinho
   let montagem = [];
   let variacao = "";
   let precoFinal = prodAtual.preco;
+
+  if (tipo === "combo_fechado") {
+    const partes = _comboFechadoConfig.sabores
+      .filter((s) => (_comboFechadoConfig.selecao[s.id] || 0) > 0)
+      .map((s) => `${s.nome} ×${_comboFechadoConfig.selecao[s.id]}`);
+    montagem.push(partes.join(", "));
+  }
 
   if (tipo === "montavel") {
     const cfgEtapas = Array.isArray(cfg)
@@ -2103,16 +2346,9 @@ function adicionarDoModal() {
     //   Total   = (Base + Extra) * qtd + Borda * qtd
     // ─────────────────────────────────────────────────────────────
     const saboresOk = (_pizzaConfig.sabores || []).filter(Boolean);
-    const _tam    = _pizzaConfig.tamanhoSelecionado;
-    const _tipo   = _pizzaConfig.tipoSelecionado;
-    // Preço base: usa precos[tipo] se disponível, senão tam.preco
-    const tamPreco = (_tipo && _tam?.precos?.[_tipo])
-      ? _tam.precos[_tipo]
-      : (_tam?.preco || 0);
-    // Regra de ouro: prevalece o sabor mais caro
-    const saborMaisCaro = saboresOk.reduce((acc, s) => Math.max(acc, s.preco || 0), 0);
+    const _tam       = _pizzaConfig.tamanhoSelecionado;
     const precoBorda = _pizzaConfig.bordaConfig?.preco || 0;
-    precoFinal = tamPreco + saborMaisCaro + precoBorda;
+    precoFinal = _calcularBasePizza(_tam, saboresOk) + precoBorda;
 
     variacao = _pizzaConfig.tamanhoSelecionado?.nome || "";
     const numSab = _pizzaConfig.numSabores || 1;
@@ -2232,6 +2468,7 @@ function adicionarDoModal() {
     bordaConfig: null,
   };
   _variacaoSelecionada = null;
+  _comboFechadoConfig = { limite: 0, sabores: [], selecao: {} };
   if (prodAtual) prodAtual._variacaoImg = null;
 
   updateUI();
@@ -2988,6 +3225,17 @@ function _executarGetPosition(btn, msg, boxErro) {
       }
 
       if (TABELA_FRETE && TABELA_FRETE[freteIndex] !== undefined) {
+        // Verifica se a faixa está marcada como "a combinar" no admin
+        if (TABELA_FRETE[freteIndex].acombinar === true) {
+          freteCalculado = -1; // sentinela: a combinar
+          msg.innerHTML = `<span style="color:#e67e22">⚠️ Distância: ${dist.toFixed(1)}km — Frete <strong>a combinar</strong> pelo WhatsApp.</span>`;
+          msg.style.color = "#e67e22";
+          boxErro.style.display = "none";
+          btn.innerText = "✅ Localização OK";
+          btn.disabled = false;
+          atualizarTotalCheckout();
+          return;
+        }
         freteCalculado = TABELA_FRETE[freteIndex].loja || 0;
         freteMotoboy = TABELA_FRETE[freteIndex].motoboy || 0;
       } else {
@@ -3060,7 +3308,37 @@ function calcularDistancia(lat1, lon1, lat2, lon2) {
 // ==========================================
 // 8. ENVIO DO PEDIDO
 // ==========================================
+// ── Trava global anti-duplo-clique ──────────────────────────────
+let _enviandoPedido = false;
+
 async function enviarZap() {
+  // Bloqueia se já está processando
+  if (_enviandoPedido) return;
+  _enviandoPedido = true;
+
+  // Desabilita e sinaliza o botão visualmente
+  const _btnEnviar = document.querySelector("[onclick=\"enviarZap()\"]")
+                  || document.querySelector("[onclick='enviarZap()']");
+  const _textoOriginal = _btnEnviar ? _btnEnviar.innerHTML : "";
+  if (_btnEnviar) {
+    _btnEnviar.disabled     = true;
+    _btnEnviar.style.opacity = "0.6";
+    _btnEnviar.innerHTML    = "⏳ Processando...";
+  }
+
+  // Libera automaticamente após 60 s (garante que não trava para sempre)
+  const _liberarBotao = () => {
+    _enviandoPedido = false;
+    if (_btnEnviar) {
+      _btnEnviar.disabled     = false;
+      _btnEnviar.style.opacity = "1";
+      _btnEnviar.innerHTML    = _textoOriginal;
+    }
+  };
+  const _timerLiberar = setTimeout(_liberarBotao, 60000);
+
+  try {
+
   const nome = document.getElementById("cli-nome").value.trim();
   const ddi = document.getElementById("cli-ddi").value;
   const tel = document.getElementById("cli-tel").value.trim();
@@ -3507,6 +3785,14 @@ async function enviarZap() {
   // Hash anti-duplicata salvo APENAS na abertura do WhatsApp (em _abrirZapEFechar)
   // Modal de confirmação 5s antes de abrir WhatsApp
   await _mostrarModalEnvio(msg, numeroPedido);
+
+  } catch (err) {
+    console.error("[enviarZap] Erro inesperado:", err);
+    alert("Ocorreu um erro ao processar o pedido. Tente novamente.");
+  } finally {
+    clearTimeout(_timerLiberar);
+    _liberarBotao();
+  }
 }
 
 // Modal: "Seu pedido será validado somente após enviar no WhatsApp"
