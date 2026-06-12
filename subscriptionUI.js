@@ -285,7 +285,7 @@ const SubscriptionUI = (() => {
       const { getServerDate, calcularStatusAssinatura } = window.SubscriptionDateUtils;
 
       // ── Só adminMaster nunca é bloqueado ──
-      const isGestor = window.perfilUsuario === 'adminMaster';
+      const isGestor = perfil === 'adminMaster' || window.perfilUsuario === 'adminMaster';
 
       // Paralelo: data do servidor + config da assinatura
       const [hoje, cfg] = await Promise.all([
